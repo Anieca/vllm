@@ -23,12 +23,9 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.config.multimodal import MultiModalDummyOptions
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.inputs import MultiModalDataDict
-from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
     QKVParallelLinear,
-    RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -50,9 +47,9 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
+from .bert import BertIntermediate, BertOutput, BertSelfOutput
 from .clip import CLIPVisionModel
 from .interfaces import MultiModalEmbeddings, SupportsMultiModal
-from .module_mapping import MultiModelKeys
 from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
 
 
@@ -215,30 +212,6 @@ class GitSelfAttention(nn.Module):
         return self.attn(q, k, v)
 
 
-class GitSelfOutput(nn.Module):
-    def __init__(
-        self,
-        config: GitConfig,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.dense = RowParallelLinear(
-            config.hidden_size,
-            config.hidden_size,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.dense",
-        )
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
-    def forward(
-        self, hidden_states: torch.Tensor, input_tensor: torch.Tensor
-    ) -> torch.Tensor:
-        hidden_states, _ = self.dense(hidden_states)
-        return self.LayerNorm(hidden_states + input_tensor)
-
-
 class GitAttention(nn.Module):
     def __init__(
         self,
@@ -251,56 +224,15 @@ class GitAttention(nn.Module):
         self.self = GitSelfAttention(
             config, cache_config, quant_config, prefix=f"{prefix}.self"
         )
-        self.output = GitSelfOutput(config, quant_config, prefix=f"{prefix}.output")
+        self.output = BertSelfOutput(
+            config.hidden_size,
+            config.layer_norm_eps,
+            quant_config,
+            prefix=f"{prefix}.output",
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.output(self.self(hidden_states), hidden_states)
-
-
-class GitIntermediate(nn.Module):
-    def __init__(
-        self,
-        config: GitConfig,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.dense = ColumnParallelLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.dense",
-        )
-        self.intermediate_act_fn = get_act_fn(config.hidden_act)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states, _ = self.dense(hidden_states)
-        return self.intermediate_act_fn(hidden_states)
-
-
-class GitOutput(nn.Module):
-    def __init__(
-        self,
-        config: GitConfig,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.dense = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.dense",
-        )
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
-    def forward(
-        self, hidden_states: torch.Tensor, input_tensor: torch.Tensor
-    ) -> torch.Tensor:
-        hidden_states, _ = self.dense(hidden_states)
-        return self.LayerNorm(hidden_states + input_tensor)
 
 
 class GitLayer(nn.Module):
@@ -315,10 +247,20 @@ class GitLayer(nn.Module):
         self.attention = GitAttention(
             config, cache_config, quant_config, prefix=f"{prefix}.attention"
         )
-        self.intermediate = GitIntermediate(
-            config, quant_config, prefix=f"{prefix}.intermediate"
+        self.intermediate = BertIntermediate(
+            config.hidden_size,
+            config.intermediate_size,
+            config.hidden_act,
+            quant_config,
+            prefix=f"{prefix}.intermediate",
         )
-        self.output = GitOutput(config, quant_config, prefix=f"{prefix}.output")
+        self.output = BertOutput(
+            config.hidden_size,
+            config.intermediate_size,
+            config.layer_norm_eps,
+            quant_config,
+            prefix=f"{prefix}.output",
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         attention_output = self.attention(hidden_states)
@@ -527,10 +469,3 @@ class GitForCausalLM(nn.Module, SupportsMultiModal):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-    def get_mm_mapping(self) -> MultiModelKeys:
-        return MultiModelKeys.from_string_field(
-            language_model="language_model",
-            connector="visual_projection",
-            tower_model="image_encoder",
-        )
