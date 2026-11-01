@@ -19,6 +19,7 @@ PROMPT = (
     "<start_of_image>What is the content in the center of the image?"
     "<end_of_turn>\n<start_of_turn>model\n"
 )
+TINY_MODEL = "hf-internal-testing/tiny-random-Gemma3ForConditionalGeneration"
 
 GIT_MODEL = "microsoft/git-base-coco"
 GIT_PROMPT = "a photo of"
@@ -61,11 +62,12 @@ def _get_hf_prefill_hidden(hf_model: HfRunner, image: Any):
 
 def _get_vllm_prefill_hidden(
     vllm_runner: type[VllmRunner],
+    model: str,
     image: Any,
     vllm_runner_kwargs: dict[str, Any],
 ):
     with vllm_runner(
-        MODEL,
+        model,
         max_model_len=4096,
         max_num_seqs=2,
         enforce_eager=True,
@@ -95,7 +97,9 @@ def test_mm_prefix_lm_e2e(
         "mm_processor_cache_gb": 0,
         "mm_processor_kwargs": {"do_pan_and_scan": True},
     }
-    vllm_hidden = _get_vllm_prefill_hidden(vllm_runner, image, vllm_runner_kwargs)
+    vllm_hidden = _get_vllm_prefill_hidden(
+        vllm_runner, MODEL, image, vllm_runner_kwargs
+    )
 
     hf_model = hf_runner(
         MODEL,
@@ -123,6 +127,28 @@ def test_mm_prefix_lm_e2e(
         "Gemma3 mm-prefix-LM image prefill hidden states should be close to HF; "
         f"got {image_cos=}"
     )
+
+
+@pytest.mark.cpu_model
+def test_mm_prefix_lm_e2e_tiny(
+    hf_runner: type[HfRunner],
+    vllm_runner: type[VllmRunner],
+    image_assets: ImageTestAssets,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Same check in fp32 with a tiny Gemma3, so it runs on CPU."""
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    image = image_assets[0].pil_image
+
+    vllm_hidden = _get_vllm_prefill_hidden(
+        vllm_runner, TINY_MODEL, image, {"dtype": "float32"}
+    )
+    with hf_runner(
+        TINY_MODEL, dtype="float32", auto_cls=AutoModelForImageTextToText
+    ) as hf_model:
+        hf_hidden = _get_hf_prefill_hidden(hf_model, image)
+
+    torch.testing.assert_close(vllm_hidden, hf_hidden, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.cpu_model
