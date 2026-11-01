@@ -1547,6 +1547,11 @@ def test_no_mm_input_chunking_at_item_boundary():
     assert ask(400, 500) == 0
     # Starts exactly at the item and covers it: schedule it.
     assert ask(400, 800) == 800
+    # Starts inside the item (a prefix cache hit ended there) and cannot finish
+    # it: schedule nothing, never a negative count.
+    assert ask(600, 500) == 0
+    # Starts inside the item and finishes it: schedule the rest.
+    assert ask(600, 600) == 600
 
 
 def test_no_mm_input_chunking_after_prefix_cache_hit_inside_item():
