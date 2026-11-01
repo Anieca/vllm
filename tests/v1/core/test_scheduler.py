@@ -1547,6 +1547,11 @@ def test_no_mm_input_chunking_at_item_boundary():
     assert ask(400, 500) == 0
     # Starts exactly at the item and covers it: schedule it.
     assert ask(400, 800) == 800
+    # Starts inside the item (prefix cache hit ending mid-item) and cannot
+    # finish it: schedule nothing rather than another part of the item.
+    assert ask(600, 500) == 0
+    # Starts inside the item and finishes it: schedule the remainder.
+    assert ask(600, 600) == 600
 
 
 @pytest.mark.parametrize("enable_prefix_caching", [True, False])
