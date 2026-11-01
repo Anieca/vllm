@@ -802,6 +802,16 @@ class Gemma4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
         )
 
 
+class GitModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    def derive_max_model_len_and_key(self) -> tuple[float, str | None]:
+        # `max_position_embeddings` only covers the text: the image tokens in
+        # front of it have no position embedding.
+        max_len, key = super().derive_max_model_len_and_key()
+        vision_config = self.hf_config.vision_config
+        num_patches = (vision_config.image_size // vision_config.patch_size) ** 2
+        return max_len + num_patches + 1, key
+
+
 class MossAudioModelArchConfigConvertor(ModelArchConfigConvertorBase):
     def _language_config(self) -> PreTrainedConfig:
         return self.hf_config.language_config
@@ -863,6 +873,7 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
     "gemma4_text": Gemma4ModelArchConfigConvertor,
     "gemma4_unified": Gemma4ModelArchConfigConvertor,
     "gemma4_unified_text": Gemma4ModelArchConfigConvertor,
+    "git": GitModelArchConfigConvertor,
     "glm4_moe_mtp": GLM4MoeMTPModelArchConfigConvertor,
     "glm_ocr_mtp": GLM4MoeMTPModelArchConfigConvertor,
     "longcat_flash": LongCatFlashModelArchConfigConvertor,
