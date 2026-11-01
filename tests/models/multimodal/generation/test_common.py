@@ -395,6 +395,21 @@ VLM_TEST_SETTINGS = {
         auto_cls=AutoModelForImageTextToText,
         vllm_runner_kwargs={"limit_mm_per_prompt": {"image": 4}},
     ),
+    "git": VLMTestInfo(
+        models=["microsoft/git-base-coco"],
+        test_type=VLMTestType.IMAGE,
+        prompt_formatter=identity,
+        img_idx_to_prompt=lambda idx: "",
+        single_image_prompts=IMAGE_ASSETS.prompts(
+            {
+                "stop_sign": "a photo of",
+                "cherry_blossom": "",
+            }
+        ),
+        max_model_len=512,
+        patch_hf_runner=model_utils.git_patch_hf_runner,
+        marks=[pytest.mark.cpu_model],
+    ),
     "granite_vision": VLMTestInfo(
         models=["ibm-granite/granite-vision-3.3-2b"],
         test_type=(VLMTestType.IMAGE),

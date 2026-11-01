@@ -957,6 +957,10 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     "GraniteSpeechPlusForConditionalGeneration": _HfExamplesInfo(
         "ibm-granite/granite-speech-4.1-2b-plus",
     ),
+    "GitForCausalLM": _HfExamplesInfo(
+        "microsoft/git-base-coco",
+        extras={"textvqa": "microsoft/git-base-textvqa"},
+    ),
     "GLM4VForCausalLM": _HfExamplesInfo(
         "zai-org/glm-4v-9b",
         trust_remote_code=True,

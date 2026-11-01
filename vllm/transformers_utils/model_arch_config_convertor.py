@@ -357,6 +357,7 @@ class ModelArchConfigConvertorBase:
         MM_PREFIX_LM_MODELS = (
             "bagel",
             "gemma3",
+            "git",
             "molmo2",
             "moondream3",
             "paligemma",
