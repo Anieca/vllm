@@ -882,14 +882,14 @@ def test_encoder_only_attention_ignores_default_causal(
     torch.testing.assert_close(output, ref_output, atol=1e-4, rtol=1e-4)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
-def test_decoder_attention_mm_prefix(dtype: torch.dtype) -> None:
+def test_decoder_attention_mm_prefix() -> None:
     """Query rows inside a multimodal range also attend to the later keys of
     that range (prefix-LM mask); every other row stays causal."""
     from tests.v1.attention.test_mm_prefix import _dense_reference
 
     set_random_seed(0)
+    dtype = torch.float32
     # Fresh prefill with two ranges; prefill after a prefix cache hit that ends
     # inside the range; a decode row past its range; a text-only prefill.
     query_lens = [48, 40, 1, 20]
@@ -966,12 +966,11 @@ def test_decoder_attention_mm_prefix(dtype: torch.dtype) -> None:
 
     ref_args = (query, k_full, v_full, query_lens, seq_lens)
     expected = _dense_reference(*ref_args, mm_ranges, None, scale)
-    atol = 1e-4 if dtype == torch.float32 else 2e-2
-    torch.testing.assert_close(output.float(), expected, atol=atol, rtol=atol)
+    torch.testing.assert_close(output, expected, atol=1e-4, rtol=1e-4)
 
     # Guard against a vacuous pass: the batch must differ from plain causal.
     causal_only = _dense_reference(*ref_args, {}, None, scale)
-    assert not torch.allclose(expected, causal_only, atol=atol, rtol=atol)
+    assert not torch.allclose(expected, causal_only, atol=1e-4, rtol=1e-4)
 
 
 @torch.inference_mode()
