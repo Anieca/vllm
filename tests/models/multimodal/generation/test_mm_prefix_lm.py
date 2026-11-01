@@ -20,6 +20,9 @@ PROMPT = (
     "<end_of_turn>\n<start_of_turn>model\n"
 )
 
+GIT_MODEL = "microsoft/git-base-coco"
+GIT_PROMPT = "a photo of"
+
 
 def _install_prefill_hidden_capture(model):
     model = getattr(model, "module", model)
@@ -120,10 +123,6 @@ def test_mm_prefix_lm_e2e(
         "Gemma3 mm-prefix-LM image prefill hidden states should be close to HF; "
         f"got {image_cos=}"
     )
-
-
-GIT_MODEL = "microsoft/git-base-coco"
-GIT_PROMPT = "a photo of"
 
 
 @pytest.mark.cpu_model
