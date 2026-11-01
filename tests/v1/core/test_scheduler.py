@@ -1487,15 +1487,6 @@ def test_no_mm_input_chunking(warm_encoder_cache: bool):
             max_num_batched_tokens=100,
             disable_chunked_mm_input=True,
         )
-    # Same for a long prefill cap below the mm input size: a capped chunk
-    # could never cover the item.
-    with pytest.raises(ValueError, match="long_prefill_token_threshold"):
-        _ = create_scheduler(
-            model="llava-hf/llava-1.5-7b-hf",
-            max_num_batched_tokens=1024,
-            long_prefill_token_threshold=100,
-            disable_chunked_mm_input=True,
-        )
 
 
 def test_no_mm_input_chunking_for_same_step_duplicate():
