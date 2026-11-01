@@ -120,3 +120,39 @@ def test_mm_prefix_lm_e2e(
         "Gemma3 mm-prefix-LM image prefill hidden states should be close to HF; "
         f"got {image_cos=}"
     )
+
+
+GIT_MODEL = "microsoft/git-base-coco"
+GIT_PROMPT = "a photo of"
+
+
+@pytest.mark.cpu_model
+def test_mm_prefix_lm_e2e_git(
+    hf_runner: type[HfRunner],
+    vllm_runner: type[VllmRunner],
+    image_assets: ImageTestAssets,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """GIT's image tokens attend to each other bidirectionally. Its prefill
+    hidden states only match HF if the attention backend applies that mask."""
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    image = image_assets[0].pil_image
+
+    with vllm_runner(
+        GIT_MODEL,
+        dtype="float32",
+        enforce_eager=True,
+        limit_mm_per_prompt={"image": 1},
+    ) as vllm_model:
+        vllm_model.apply_model(_install_prefill_hidden_capture)
+        vllm_model.generate_greedy([GIT_PROMPT], max_tokens=1, images=[image])
+        vllm_hidden = vllm_model.apply_model(_get_prefill_hidden)[0]
+
+    hf_model = model_utils.git_patch_hf_runner(hf_runner(GIT_MODEL, dtype="float32"))
+    with hf_model:
+        inputs = hf_model.get_inputs([GIT_PROMPT], images=[image])[0]
+        with torch.no_grad():
+            hf_hidden = hf_model.model.git(**hf_model.wrap_device(inputs))
+        hf_hidden = hf_hidden.last_hidden_state[0].float().cpu()
+
+    torch.testing.assert_close(vllm_hidden, hf_hidden, atol=1e-3, rtol=1e-3)
