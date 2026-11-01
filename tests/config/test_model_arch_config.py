@@ -10,7 +10,7 @@ from typing import cast
 from unittest.mock import Mock
 
 import pytest
-from transformers import DiffusionGemmaConfig, PreTrainedConfig
+from transformers import DiffusionGemmaConfig, GitConfig, PreTrainedConfig
 from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
 
 from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
@@ -18,6 +18,7 @@ from vllm.config.model_arch import ModelArchitectureConfig
 from vllm.transformers_utils.model_arch_config_convertor import (
     MODEL_ARCH_CONFIG_CONVERTORS,
     Gemma4ModelArchConfigConvertor,
+    GitModelArchConfigConvertor,
     ModelArchConfigConvertorBase,
 )
 
@@ -394,6 +395,21 @@ def _gemma4_text_config(**overrides) -> Gemma4TextConfig:
         layer_types=["sliding_attention"] * 5 + ["full_attention"],
     )
     return Gemma4TextConfig(**(fields | overrides))
+
+
+def test_git_max_model_len_includes_image_tokens():
+    """GIT's position table covers the text only, not the image in front of it."""
+    config = GitConfig(
+        max_position_embeddings=1024,
+        vision_config={"image_size": 480, "patch_size": 16},
+    )
+
+    convertor = GitModelArchConfigConvertor(config, config)
+
+    assert convertor.derive_max_model_len_and_key() == (
+        1024 + 30 * 30 + 1,
+        "max_position_embeddings",
+    )
 
 
 def test_gemma4_head_dims_vary_by_layer_type():

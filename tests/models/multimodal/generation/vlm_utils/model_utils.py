@@ -275,6 +275,25 @@ def gemma3_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
     return hf_model
 
 
+def git_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
+    """Patches and returns an instance of the HfRunner to use for GIT."""
+    hf_processor = hf_model.processor
+    sep_token_id = hf_processor.tokenizer.sep_token_id
+
+    def processor(*args, **kwargs):
+        # Like vLLM's GIT processor, generate after `[CLS] prompt` rather than
+        # after the closing `[SEP]` (= EOS) the BERT tokenizer appends.
+        inputs = hf_processor(*args, **kwargs)
+        if inputs["input_ids"][0, -1] == sep_token_id:
+            inputs["input_ids"] = inputs["input_ids"][:, :-1]
+            inputs["attention_mask"] = inputs["attention_mask"][:, :-1]
+        return inputs
+
+    hf_model.processor = processor
+
+    return hf_model
+
+
 def gemma3_vllm_to_hf_output(vllm_output: RunnerOutput, model: str) -> RunnerOutput:
     """Sanitize vllm output [gemma-3] to compare with hf output."""
     output_ids, output_str, out_logprobs = vllm_output

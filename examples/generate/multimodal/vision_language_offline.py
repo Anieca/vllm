@@ -498,6 +498,23 @@ def run_gemma4(questions: list[str], modality: str) -> ModelRequestData:
 
 
 # GLM-4v
+# GIT
+def run_git(questions: list[str], modality: str) -> ModelRequestData:
+    assert modality == "image"
+
+    # GIT has no chat format: the image is prepended to `[CLS] question` and
+    # the model continues the text with the answer.
+    engine_args = EngineArgs(
+        model="microsoft/git-base-vqav2",
+        limit_mm_per_prompt={modality: 1},
+    )
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=[question.lower() for question in questions],
+    )
+
+
 def run_glm4v(questions: list[str], modality: str) -> ModelRequestData:
     assert modality == "image"
     model_name = "zai-org/glm-4v-9b"
@@ -2180,6 +2197,7 @@ model_example_map = {
     "gemma3": run_gemma3,
     "gemma3n": run_gemma3n,
     "gemma4": run_gemma4,
+    "git": run_git,
     "glm4v": run_glm4v,
     "glm4_1v": run_glm4_1v,
     "glm4_5v": run_glm4_5v,

@@ -428,6 +428,7 @@ _MULTIMODAL_MODELS = {
         "gemma4_unified",
         "Gemma4UnifiedForConditionalGeneration",
     ),
+    "GitForCausalLM": ("git", "GitForCausalLM"),
     "GlmAsrForConditionalGeneration": ("glmasr", "GlmAsrForConditionalGeneration"),
     "GLM4VForCausalLM": ("glm4v", "GLM4VForCausalLM"),
     "Glm4vForConditionalGeneration": ("glm4_1v", "Glm4vForConditionalGeneration"),
