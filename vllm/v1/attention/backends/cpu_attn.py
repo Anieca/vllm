@@ -339,6 +339,16 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
         )
         if not spans:
             return None
+        if self.window_size != -1 and any(
+            s.end - s.start >= self.window_size for s in spans
+        ):
+            # The kernel applies a sliding window symmetrically when not causal.
+            logger.warning_once(
+                "Multimodal bidirectional ranges longer than the sliding window "
+                "(%d) only attend up to %d tokens ahead on CPU.",
+                self.window_size,
+                self.window_size - 1,
+            )
 
         token_indices = torch.cat(
             [torch.arange(s.row_start, s.row_end, dtype=torch.int64) for s in spans]
