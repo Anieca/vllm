@@ -1556,11 +1556,68 @@ def test_no_mm_input_chunking_at_item_boundary():
     assert ask(400, 500) == 0
     # Starts exactly at the item and covers it: schedule it.
     assert ask(400, 800) == 800
-    # Starts inside the item (prefix cache hit ending mid-item) and cannot
-    # finish it: schedule nothing rather than another part of the item.
-    assert ask(600, 500) == 0
-    # Starts inside the item and finishes it: schedule the remainder.
-    assert ask(600, 600) == 600
+
+
+def test_no_mm_input_chunking_after_prefix_cache_hit_inside_item():
+    """A prefix cache hit can end inside a multimodal item (hits are block
+    aligned). The rest of the item must then be scheduled in one step too."""
+    block_size = 256
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf",
+        max_num_batched_tokens=600,
+        disable_chunked_mm_input=True,
+        enable_prefix_caching=True,
+        block_size=block_size,
+        max_model_len=2048,
+    )
+    image = [[PlaceholderRange(offset=0, length=576)]]
+
+    def make_image_request(req_id: str) -> Request:
+        return create_requests(
+            num_requests=1,
+            num_tokens=590,
+            mm_hashes_list=[["image"]],
+            mm_positions=image,
+            block_size=block_size,
+            req_ids=[req_id],
+            max_tokens=8,
+        )[0]
+
+    def step() -> dict[str, int]:
+        output = scheduler.schedule()
+        req_ids = list(output.num_scheduled_tokens)
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+                sampled_token_ids=[
+                    [1]
+                    if scheduler.requests[req_id].num_computed_tokens
+                    >= scheduler.requests[req_id].num_prompt_tokens
+                    else []
+                    for req_id in req_ids
+                ],
+            ),
+        )
+        return output.num_scheduled_tokens
+
+    # Cache the image's first two blocks: 512 of its 576 tokens.
+    scheduler.add_request(make_image_request("primer"))
+    assert step() == {"primer": 590}
+
+    # A text prefill leaves 600 - 560 - 1 (primer decode) = 39 tokens, which
+    # cannot cover the 64 image tokens left after the hit.
+    filler = create_requests(
+        num_requests=2, num_tokens=560, block_size=block_size, req_ids=["x", "filler"]
+    )[1]
+    scheduler.add_request(filler)
+    scheduler.add_request(make_image_request("hit"))
+    assert step() == {"primer": 1, "filler": 560}
+    assert scheduler.requests["hit"].num_computed_tokens == 0
+
+    # Next step: the remainder (64 image + 14 text tokens) in one chunk.
+    assert step() == {"primer": 1, "filler": 1, "hit": 590 - 2 * block_size}
 
 
 @pytest.mark.parametrize("enable_prefix_caching", [True, False])
