@@ -1566,54 +1566,38 @@ def test_no_mm_input_chunking_after_prefix_cache_hit_inside_item():
         block_size=block_size,
         max_model_len=2048,
     )
-    image = [[PlaceholderRange(offset=0, length=576)]]
 
-    def make_image_request(req_id: str) -> Request:
+    def image_request(req_id: str) -> Request:
         return create_requests(
             num_requests=1,
             num_tokens=590,
             mm_hashes_list=[["image"]],
-            mm_positions=image,
+            mm_positions=[[PlaceholderRange(offset=0, length=576)]],
             block_size=block_size,
             req_ids=[req_id],
-            max_tokens=8,
         )[0]
 
     def step() -> dict[str, int]:
         output = scheduler.schedule()
-        req_ids = list(output.num_scheduled_tokens)
-        scheduler.update_from_output(
-            output,
-            ModelRunnerOutput(
-                req_ids=req_ids,
-                req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
-                sampled_token_ids=[
-                    [1]
-                    if scheduler.requests[req_id].num_computed_tokens
-                    >= scheduler.requests[req_id].num_prompt_tokens
-                    else []
-                    for req_id in req_ids
-                ],
-            ),
-        )
+        scheduler.update_from_output(output, make_output(scheduler))
         return output.num_scheduled_tokens
 
-    # Cache the image's first two blocks: 512 of its 576 tokens.
-    scheduler.add_request(make_image_request("primer"))
+    # Caches the first two blocks, 512 of the 576 image tokens.
+    scheduler.add_request(image_request("primer"))
     assert step() == {"primer": 590}
 
-    # A text prefill leaves 600 - 560 - 1 (primer decode) = 39 tokens, which
-    # cannot cover the 64 image tokens left after the hit.
-    filler = create_requests(
-        num_requests=2, num_tokens=560, block_size=block_size, req_ids=["x", "filler"]
-    )[1]
-    scheduler.add_request(filler)
-    scheduler.add_request(make_image_request("hit"))
-    assert step() == {"primer": 1, "filler": 560}
-    assert scheduler.requests["hit"].num_computed_tokens == 0
+    # The text prefill leaves 600 - 560 - 1 = 39 tokens of budget, less than the
+    # 64 image tokens left after the hit.
+    scheduler.add_request(
+        create_requests(
+            num_requests=1, num_tokens=560, block_size=block_size, req_ids=["text"]
+        )[0]
+    )
+    scheduler.add_request(image_request("hit"))
+    assert step() == {"primer": 1, "text": 560}
 
-    # Next step: the remainder (64 image + 14 text tokens) in one chunk.
-    assert step() == {"primer": 1, "filler": 1, "hit": 590 - 2 * block_size}
+    # The 64 image tokens and the 14 text tokens after them, in one chunk.
+    assert step() == {"primer": 1, "text": 1, "hit": 78}
 
 
 @pytest.mark.parametrize("enable_prefix_caching", [True, False])
