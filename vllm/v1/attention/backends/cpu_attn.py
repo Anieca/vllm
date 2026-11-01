@@ -121,14 +121,12 @@ class CPUAttentionBackend(AttentionBackend):
 
 @dataclass
 class CPUMMPrefixMetadata:
-    """Re-run of the query rows inside multimodal bidirectional ranges.
+    """Query rows inside multimodal bidirectional ranges, re-attended non-causally.
 
-    The main kernel call treats every row causally. Rows inside an mm_prefix
-    range must also see the later keys of their range, so they are gathered
-    into a synthetic batch (one sequence per span) whose sequence length stops
-    at the end of the range, and attended non-causally. This reads the KV cache
-    through the kernel itself, so it is independent of the ISA-specific cache
-    layout and KV cache dtype.
+    The causal pass cannot see the later keys of a range, so these rows are
+    gathered into a synthetic batch (one sequence per span, ending at the end of
+    the range) and run through the same paged kernel, which keeps the KV cache
+    layout and dtype out of this code.
     """
 
     token_indices: torch.Tensor
@@ -358,8 +356,7 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
         )
         query_start_loc = torch.zeros(len(spans) + 1, dtype=torch.int32)
         torch.cumsum(query_lens, 0, out=query_start_loc[1:])
-        # Keys stop at the end of the range, clipped to what has been computed
-        # so far (the rest of the range may arrive in a later prefill chunk).
+        # Keys end with the range, or with what is computed if it is not complete.
         seq_lens = torch.tensor(
             [min(s.end + 1, int(seq_lens_cpu[s.req_idx])) for s in spans],
             dtype=torch.int32,
@@ -568,8 +565,6 @@ class CPUAttentionBackendImpl(AttentionImpl):
         )
 
         if (mm_prefix := attn_metadata.mm_prefix) is not None:
-            # Overwrite the rows inside multimodal ranges with a non-causal
-            # pass whose keys end at the range end (see CPUMMPrefixMetadata).
             mm_query = query.index_select(0, mm_prefix.token_indices)
             mm_output = torch.empty(
                 (mm_query.shape[0], *output.shape[1:]),
