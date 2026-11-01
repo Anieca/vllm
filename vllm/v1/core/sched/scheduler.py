@@ -2095,21 +2095,24 @@ class Scheduler(SchedulerInterface):
             # If no encoder input chunking is allowed, we do not want to
             # partially schedule a multimodal item. If the scheduled range would
             # only cover part of the mm input, roll back to before the mm item.
-            # A prefix cache hit can also end inside the item; the remainder of
-            # the item must then be scheduled in one step as well, so schedule
-            # nothing until it fits.
             if (
                 self.scheduler_config.disable_chunked_mm_input
                 and not self.is_encoder_decoder
                 and (num_computed_tokens + num_new_tokens)
                 < (start_pos + num_encoder_tokens)
             ):
-                # Account for EAGLE shift when rolling back to avoid
-                # encoder cache miss. This ensures the scheduled range
-                # stops before start_pos even with the shift.
-                num_new_tokens = max(
-                    0, start_pos - (num_computed_tokens + shift_computed_tokens)
-                )
+                if num_computed_tokens < start_pos:
+                    # Account for EAGLE shift when rolling back to avoid
+                    # encoder cache miss. This ensures the scheduled range
+                    # stops before start_pos even with the shift.
+                    num_new_tokens = max(
+                        0, start_pos - (num_computed_tokens + shift_computed_tokens)
+                    )
+                else:
+                    # The chunk starts on or inside the item (a prefix cache hit
+                    # can end inside it), so there is nothing to roll back to.
+                    # Schedule nothing until the rest of the item fits.
+                    num_new_tokens = 0
                 break
 
             if not self.is_encoder_decoder:
