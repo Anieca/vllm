@@ -20,13 +20,16 @@ from vllm.platforms import CpuArchEnum, current_platform
 from vllm.platforms.cpu import CpuPlatform
 from vllm.utils.torch_utils import set_default_torch_num_threads, set_random_seed
 from vllm.v1.attention.backend import AttentionType
-from vllm.v1.attention.backends.cpu_attn import _get_attn_isa
+from vllm.v1.attention.backends.cpu_attn import (
+    CPUAttentionBackendImpl,
+    _get_attn_isa,
+)
 from vllm.v1.attention.backends.zentorch_sdpa import (
     should_use_zentorch_sdpa,
     zentorch_sdpa_attn,
 )
 from vllm.v1.attention.selector import AttentionSelectorConfig
-from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
+from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec, FullAttentionSpec
 
 if not current_platform.is_cpu():
     pytest.skip("skipping CPU-only tests", allow_module_level=True)
@@ -281,6 +284,43 @@ def ref_varlen_encoder_attn(
         start_idx += seq_len
 
     return output
+
+
+def ref_mm_prefix_attn(
+    query: torch.Tensor,  # [token, q_head_num, head_dim]
+    keys: list[torch.Tensor],  # per request: [kv_len, kv_head_num, head_dim]
+    values: list[torch.Tensor],
+    query_lens: list[int],
+    kv_lens: list[int],
+    mm_ranges: dict[int, list[tuple[int, int]]],  # request -> inclusive ranges
+    scale: float,
+) -> torch.Tensor:
+    """Causal attention where tokens inside the same multimodal range also see
+    each other."""
+    outputs: list[torch.Tensor] = []
+    start_idx = 0
+    for i, (query_len, kv_len) in enumerate(zip(query_lens, kv_lens)):
+        q = query[start_idx : start_idx + query_len].float() * scale
+        k = keys[i].float()
+        v = values[i].float()
+        if q.shape[1] != k.shape[1]:
+            k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
+            v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
+        attn = torch.einsum("qhd,khd->hqk", q, k)
+
+        q_pos = torch.arange(kv_len - query_len, kv_len)[:, None]
+        kv_pos = torch.arange(kv_len)[None, :]
+        visible = kv_pos <= q_pos
+        for start, end in mm_ranges.get(i, []):
+            in_range = (start <= q_pos) & (q_pos <= end)
+            visible |= in_range & (start <= kv_pos) & (kv_pos <= end)
+
+        attn.masked_fill_(~visible, float("-inf"))
+        attn = torch.softmax(attn, dim=-1)
+        outputs.append(torch.einsum("hqk,khd->qhd", attn, v).to(query.dtype))
+        start_idx += query_len
+
+    return torch.cat(outputs, dim=0)
 
 
 @torch.inference_mode()
@@ -877,6 +917,95 @@ def test_encoder_only_attention_ignores_default_causal(
         sliding_window=sliding_window,
     )
     torch.testing.assert_close(output, ref_output, atol=1e-4, rtol=1e-4)
+
+
+@torch.inference_mode()
+def test_decoder_attention_mm_prefix() -> None:
+    """Query rows inside a multimodal range also attend to the later keys of
+    that range (prefix-LM mask); every other row stays causal."""
+    set_random_seed(0)
+    dtype = torch.float32
+    # Fresh prefill with two ranges; prefill after a prefix cache hit that ends
+    # inside the range; a decode row past its range; a text-only prefill.
+    query_lens = [48, 40, 1, 20]
+    seq_lens = [48, 100, 90, 20]
+    mm_ranges = {0: [(3, 20), (25, 33)], 1: [(10, 79)], 2: [(0, 50)]}
+    num_heads, num_kv_heads, head_size = 4, 2, 64
+    block_size = 32
+    scale = head_size**-0.5
+    device = torch.device("cpu")
+    layer_name = "model.layers.0.self_attn.attn"
+    vllm_config = create_vllm_config(dtype=dtype, block_size=block_size)
+
+    with set_current_vllm_config(vllm_config):
+        layer = Attention(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads=num_kv_heads,
+            prefix=layer_name,
+        )
+        spec = FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=dtype,
+        )
+        builder = layer.get_attn_backend().get_builder_cls()(
+            spec, [layer_name], vllm_config, device
+        )
+        common_attn_metadata = create_common_attn_metadata(
+            BatchSpec(seq_lens=seq_lens, query_lens=query_lens),
+            block_size,
+            device,
+            arange_block_indices=True,
+        )
+        common_attn_metadata.mm_req_doc_ranges = mm_ranges
+        attn_metadata = builder.build(0, common_attn_metadata)
+        impl = layer.impl
+        assert isinstance(impl, CPUAttentionBackendImpl)
+
+        # Write the whole sequence (cached context + scheduled tokens) of each
+        # request into its blocks, then attend with the scheduled queries.
+        block_table = common_attn_metadata.block_table_tensor
+        k_full = [
+            torch.randn(s, num_kv_heads, head_size, dtype=dtype) for s in seq_lens
+        ]
+        v_full = [
+            torch.randn(s, num_kv_heads, head_size, dtype=dtype) for s in seq_lens
+        ]
+        slots = torch.cat(
+            [
+                block_table[i, pos // block_size].long() * block_size + pos % block_size
+                for i, pos in enumerate(torch.arange(s) for s in seq_lens)
+            ]
+        )
+        kv_cache = torch.zeros(
+            block_table.numel(), num_kv_heads, block_size, 2 * head_size, dtype=dtype
+        )
+        impl.do_kv_cache_update(
+            layer, torch.cat(k_full), torch.cat(v_full), kv_cache, slots
+        )
+
+        query = torch.randn(sum(query_lens), num_heads, head_size, dtype=dtype)
+        new_keys = torch.cat(
+            [k[s - q :] for k, s, q in zip(k_full, seq_lens, query_lens)]
+        )
+        new_values = torch.cat(
+            [v[s - q :] for v, s, q in zip(v_full, seq_lens, query_lens)]
+        )
+        output = torch.empty_like(query)
+        impl.forward(
+            layer, query, new_keys, new_values, kv_cache, attn_metadata, output
+        )
+
+    ref_args = (query, k_full, v_full, query_lens, seq_lens)
+    ref_output = ref_mm_prefix_attn(*ref_args, mm_ranges, scale)
+    torch.testing.assert_close(output, ref_output, atol=1e-5, rtol=1e-5)
+
+    # The ranges must matter, or the comparison above proves nothing.
+    causal_output = ref_mm_prefix_attn(*ref_args, {}, scale)
+    assert not torch.allclose(ref_output, causal_output, atol=1e-5, rtol=1e-5)
 
 
 @torch.inference_mode()
