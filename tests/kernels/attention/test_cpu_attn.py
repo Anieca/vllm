@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.v1.attention.test_mm_prefix import _dense_reference
 from tests.v1.attention.utils import (
     BatchSpec,
     create_common_attn_metadata,
@@ -284,43 +285,6 @@ def ref_varlen_encoder_attn(
         start_idx += seq_len
 
     return output
-
-
-def ref_mm_prefix_attn(
-    query: torch.Tensor,  # [token, q_head_num, head_dim]
-    keys: list[torch.Tensor],  # per request: [kv_len, kv_head_num, head_dim]
-    values: list[torch.Tensor],
-    query_lens: list[int],
-    kv_lens: list[int],
-    mm_ranges: dict[int, list[tuple[int, int]]],  # request -> inclusive ranges
-    scale: float,
-) -> torch.Tensor:
-    """Causal attention where tokens inside the same multimodal range also see
-    each other."""
-    outputs: list[torch.Tensor] = []
-    start_idx = 0
-    for i, (query_len, kv_len) in enumerate(zip(query_lens, kv_lens)):
-        q = query[start_idx : start_idx + query_len].float() * scale
-        k = keys[i].float()
-        v = values[i].float()
-        if q.shape[1] != k.shape[1]:
-            k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
-            v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
-        attn = torch.einsum("qhd,khd->hqk", q, k)
-
-        q_pos = torch.arange(kv_len - query_len, kv_len)[:, None]
-        kv_pos = torch.arange(kv_len)[None, :]
-        visible = kv_pos <= q_pos
-        for start, end in mm_ranges.get(i, []):
-            in_range = (start <= q_pos) & (q_pos <= end)
-            visible |= in_range & (start <= kv_pos) & (kv_pos <= end)
-
-        attn.masked_fill_(~visible, float("-inf"))
-        attn = torch.softmax(attn, dim=-1)
-        outputs.append(torch.einsum("hqk,khd->qhd", attn, v).to(query.dtype))
-        start_idx += query_len
-
-    return torch.cat(outputs, dim=0)
 
 
 @torch.inference_mode()
@@ -1000,11 +964,11 @@ def test_decoder_attention_mm_prefix() -> None:
         )
 
     ref_args = (query, k_full, v_full, query_lens, seq_lens)
-    ref_output = ref_mm_prefix_attn(*ref_args, mm_ranges, scale)
+    ref_output = _dense_reference(*ref_args, mm_ranges, None, scale)
     torch.testing.assert_close(output, ref_output, atol=1e-5, rtol=1e-5)
 
     # The ranges must matter, or the comparison above proves nothing.
-    causal_output = ref_mm_prefix_attn(*ref_args, {}, scale)
+    causal_output = _dense_reference(*ref_args, {}, None, scale)
     assert not torch.allclose(ref_output, causal_output, atol=1e-5, rtol=1e-5)
 
 
