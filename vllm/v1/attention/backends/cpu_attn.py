@@ -29,6 +29,8 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import (
+    MMPrefixQuerySpan,
+    compute_mm_prefix_query_spans,
     get_num_attention_heads_from_layers,
 )
 from vllm.v1.attention.backends.zentorch_sdpa import (
@@ -95,6 +97,10 @@ class CPUAttentionBackend(AttentionBackend):
         return True
 
     @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        return True
+
+    @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
         """CPU attention supports decoder,
         encoder-only and encoder-decoder attention."""
@@ -112,6 +118,23 @@ class CPUAttentionBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> type["CPUAttentionMetadataBuilder"]:
         return CPUAttentionMetadataBuilder
+
+
+@dataclass
+class CPUMMPrefixMetadata:
+    """The batch cut at multimodal bidirectional ranges, used in its place.
+
+    Each piece is a sequence of its own over its request's blocks, with keys up
+    to its last query row. Pieces inside a range are non-causal, so they see the
+    whole range; the rest stay causal. One kernel call attends all of them.
+    """
+
+    query_start_loc: torch.Tensor
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    scheduler_metadata: torch.Tensor
+    dynamic_causal: torch.Tensor
+    causal: bool = False
 
 
 @dataclass
@@ -134,6 +157,8 @@ class CPUAttentionMetadata:
     sdpa_start_loc: torch.Tensor | None = None
 
     encoder_cache: torch.Tensor | None = None
+
+    mm_prefix: CPUMMPrefixMetadata | None = None
 
 
 class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]):
@@ -278,6 +303,10 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             kv_cache_dtype=self.kv_cache_dtype,
         )
 
+        mm_prefix = None
+        if causal and common_attn_metadata.mm_req_doc_ranges:
+            mm_prefix = self._build_mm_prefix(common_attn_metadata)
+
         attn_metadata = CPUAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -290,9 +319,90 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             causal=causal,
             encoder_cache=encoder_cache_tensor,
             dynamic_causal=dynamic_casual,
+            mm_prefix=mm_prefix,
         )
 
         return attn_metadata
+
+    def _build_mm_prefix(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> CPUMMPrefixMetadata | None:
+        # Exact lengths: the pieces below replace every request, decodes included.
+        seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+        spans = compute_mm_prefix_query_spans(
+            common_attn_metadata.mm_req_doc_ranges,
+            common_attn_metadata.query_start_loc_cpu,
+            seq_lens_cpu,
+        )
+        if not spans:
+            return None
+        if self.window_size != -1 and any(
+            s.end - s.start >= self.window_size for s in spans
+        ):
+            # The kernel applies a sliding window symmetrically when not causal.
+            logger.warning_once(
+                "Multimodal bidirectional ranges longer than the sliding window "
+                "(%d) only attend up to %d tokens ahead on CPU.",
+                self.window_size,
+                self.window_size - 1,
+            )
+
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu.tolist()
+        seq_lens_list = seq_lens_cpu.tolist()
+        spans_by_req: dict[int, list[MMPrefixQuerySpan]] = {}
+        for span in sorted(spans):
+            spans_by_req.setdefault(span.req_idx, []).append(span)
+
+        # Each request becomes causal pieces around its non-causal range pieces.
+        pieces: list[tuple[int, int, int, bool]] = []  # request, start, end, causal
+        for req_idx in range(common_attn_metadata.num_reqs):
+            row = query_start_loc_cpu[req_idx]
+            for span in spans_by_req.get(req_idx, []):
+                pieces.append((req_idx, row, span.row_start, True))
+                pieces.append((req_idx, span.row_start, span.row_end, False))
+                row = span.row_end
+            pieces.append((req_idx, row, query_start_loc_cpu[req_idx + 1], True))
+        pieces = [piece for piece in pieces if piece[1] < piece[2]]
+
+        req_indices = [req_idx for req_idx, *_ in pieces]
+        query_start_loc = torch.tensor(
+            query_start_loc_cpu[:1] + [end for _, _, end, _ in pieces],
+            dtype=torch.int32,
+        )
+        # Keys end with a piece's last row, which puts its queries at their
+        # positions.
+        seq_lens = torch.tensor(
+            [
+                seq_lens_list[req_idx] - (query_start_loc_cpu[req_idx + 1] - end)
+                for req_idx, _, end, _ in pieces
+            ],
+            dtype=torch.int32,
+        )
+        dynamic_causal = torch.tensor(
+            [causal for *_, causal in pieces], dtype=torch.int32
+        )
+        scheduler_metadata = ops.cpu_attn_get_scheduler_metadata(
+            num_reqs=len(pieces),
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            seq_lens=seq_lens,
+            dtype=self.dtype,
+            query_start_loc=query_start_loc,
+            causal=False,
+            sliding_window_size=self.window_size,
+            isa=self.isa,
+            enable_kv_split=envs.VLLM_CPU_ATTN_SPLIT_KV,
+            dynamic_causal=dynamic_causal,
+            kv_cache_dtype=self.kv_cache_dtype,
+        )
+        return CPUMMPrefixMetadata(
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            block_table=common_attn_metadata.block_table_tensor[req_indices],
+            scheduler_metadata=scheduler_metadata,
+            dynamic_causal=dynamic_causal,
+        )
 
 
 class CPUAttentionBackendImpl(AttentionImpl):
@@ -448,22 +558,23 @@ class CPUAttentionBackendImpl(AttentionImpl):
             torch.float32,
         ]:
             self.sinks = self.sinks.to(torch.float32)
+        batch = attn_metadata.mm_prefix or attn_metadata
         ops.cpu_attention_with_kv_cache(
             query=query[:num_actual_tokens],
             key_cache=key_cache,
             value_cache=value_cache,
             output=output[:num_actual_tokens],  # type: ignore
-            query_start_loc=attn_metadata.query_start_loc,
-            seq_lens=attn_metadata.seq_lens,
+            query_start_loc=batch.query_start_loc,
+            seq_lens=batch.seq_lens,
             scale=self.scale,
-            causal=attn_metadata.causal,
+            causal=batch.causal,
             alibi_slopes=self.alibi_slopes,  # type: ignore
             sliding_window=self.sliding_window,
-            block_table=attn_metadata.block_table,
+            block_table=batch.block_table,
             softcap=self.logits_soft_cap,
-            scheduler_metadata=attn_metadata.scheduler_metadata,
+            scheduler_metadata=batch.scheduler_metadata,
             s_aux=self.sinks,
-            dynamic_causal=attn_metadata.dynamic_causal,
+            dynamic_causal=batch.dynamic_causal,
             k_scale=layer._k_scale_float,
             v_scale=layer._v_scale_float,
             kv_cache_dtype=self.kv_cache_dtype,

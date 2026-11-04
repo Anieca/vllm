@@ -44,6 +44,7 @@ def _cpu_config(
         architecture=architecture or model_type,
         has_inner_state=True,
         use_mla=False,
+        is_mm_prefix_lm=False,
         hf_config=SimpleNamespace(model_type=model_type),
         hf_text_config=SimpleNamespace(
             model_type=model_type,

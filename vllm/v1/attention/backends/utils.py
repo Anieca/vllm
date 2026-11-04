@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, fields
 from typing import (
     TYPE_CHECKING,
     Any,
+    NamedTuple,
     Protocol,
     TypeVar,
     cast,
@@ -136,6 +137,65 @@ def compute_mm_prefix_range_tensor(
     return padded.view(num_seqs, max_ranges, 2)
 
 
+class MMPrefixQuerySpan(NamedTuple):
+    """Scheduled query rows of one request that fall inside one mm_prefix range."""
+
+    req_idx: int
+    row_start: int
+    """First row (inclusive) in the flattened query batch."""
+    row_end: int
+    """Last row (exclusive) in the flattened query batch."""
+    start: int
+    """Absolute start position (inclusive) of the bidirectional range."""
+    end: int
+    """Absolute end position (inclusive) of the bidirectional range."""
+
+
+def compute_mm_prefix_query_spans(
+    mm_prefix_range: dict[int, list[tuple[int, int]]] | None,
+    query_start_loc_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+) -> list[MMPrefixQuerySpan]:
+    """Intersect each request's mm_prefix ranges with its scheduled query rows.
+
+    Ranges are absolute prompt positions and may extend past the tokens
+    scheduled so far under chunked prefill; the portion outside the current
+    chunk is dropped. Degenerate ranges (``start >= end``) are skipped to match
+    the Triton path's ``start < end`` validity check.
+
+    ``seq_lens_cpu`` only needs to be exact for prefill rows, since mm_prefix
+    ranges cover prompt tokens: an over-estimate on a decode row shifts that
+    row's query position further past every range, which still matches nothing.
+    """
+    if not mm_prefix_range:
+        return []
+
+    query_start_loc = query_start_loc_cpu.numpy()
+    spans: list[MMPrefixQuerySpan] = []
+    for req_idx, req_ranges in mm_prefix_range.items():
+        if not req_ranges:
+            continue
+        token_start = int(query_start_loc[req_idx])
+        query_len = int(query_start_loc[req_idx + 1]) - token_start
+        if query_len <= 0:
+            continue
+        # Absolute position of this request's first scheduled query token.
+        context_len = int(seq_lens_cpu[req_idx]) - query_len
+        for start, end in req_ranges:
+            if start >= end:
+                continue
+            first = max(start - context_len, 0)
+            last = min(end - context_len, query_len - 1)
+            if first > last:
+                continue
+            spans.append(
+                MMPrefixQuerySpan(
+                    req_idx, token_start + first, token_start + last + 1, start, end
+                )
+            )
+    return spans
+
+
 def fill_mm_prefix_query_ranges(
     out: np.ndarray,
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None,
@@ -157,20 +217,13 @@ def fill_mm_prefix_query_ranges(
     query tokens rather than by context length -- bounded by
     ``max_num_batched_tokens`` instead of ``num_seqs * max_seq_len``.
 
-    Ranges are absolute prompt positions and may extend past the tokens
-    scheduled so far under chunked prefill; the portion outside the current
-    chunk is simply not recorded. Degenerate ranges (``start >= end``) are
-    skipped to match the Triton path's ``start < end`` validity check.
-
-    ``seq_lens_cpu`` only needs to be exact for prefill rows, since mm_prefix
-    ranges cover prompt tokens: an over-estimate on a decode row shifts that
-    row's query position further past every range, which still matches nothing.
+    See :func:`compute_mm_prefix_query_spans` for how ranges are clipped to
+    the scheduled query tokens.
     """
     if mm_prefix_range is None:
         return 0
 
-    query_start_loc = query_start_loc_cpu.numpy()
-    num_actual_tokens = int(query_start_loc[-1])
+    num_actual_tokens = int(query_start_loc_cpu[-1])
     if num_actual_tokens <= 0:
         return 0
     assert num_actual_tokens <= out.shape[0], (
@@ -179,31 +232,15 @@ def fill_mm_prefix_query_ranges(
 
     # Resolve every span before touching `out`, so batches whose ranges all
     # fall outside the scheduled tokens skip the fill entirely.
-    spans: list[tuple[int, int, int, int]] = []
-    for req_idx, req_ranges in mm_prefix_range.items():
-        if not req_ranges:
-            continue
-        token_start = int(query_start_loc[req_idx])
-        query_len = int(query_start_loc[req_idx + 1]) - token_start
-        if query_len <= 0:
-            continue
-        # Absolute position of this request's first scheduled query token.
-        context_len = int(seq_lens_cpu[req_idx]) - query_len
-        for start, end in req_ranges:
-            if start >= end:
-                continue
-            first = max(start - context_len, 0)
-            last = min(end - context_len, query_len - 1)
-            if first > last:
-                continue
-            spans.append((token_start + first, token_start + last + 1, start, end))
-
+    spans = compute_mm_prefix_query_spans(
+        mm_prefix_range, query_start_loc_cpu, seq_lens_cpu
+    )
     if not spans:
         return 0
 
     out[:num_actual_tokens] = -1
-    for row_start, row_end, start, end in spans:
-        out[row_start:row_end] = (start, end)
+    for span in spans:
+        out[span.row_start : span.row_end] = (span.start, span.end)
     return num_actual_tokens
 
 

@@ -346,6 +346,19 @@ class CpuPlatform(Platform):
         scheduler_config = vllm_config.scheduler_config
         # async scheduling is not required on CPU
         scheduler_config.async_scheduling = False
+        # Same as CUDA: a bidirectional image span must be prefilled in one
+        # step, otherwise its first part cannot attend to the rest of it.
+        if (
+            model_config is not None
+            and model_config.is_mm_prefix_lm
+            and scheduler_config.is_multimodal_model
+            and not scheduler_config.disable_chunked_mm_input
+        ):
+            logger.warning_once(
+                "Forcing --disable_chunked_mm_input for models "
+                "with multimodal-bidirectional attention."
+            )
+            scheduler_config.disable_chunked_mm_input = True
 
         parallel_config = vllm_config.parallel_config
         if (
