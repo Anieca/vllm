@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
-from bisect import bisect_right
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -30,6 +29,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import (
+    MMPrefixQuerySpan,
     compute_mm_prefix_query_spans,
     get_num_attention_heads_from_layers,
 )
@@ -348,42 +348,60 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             )
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu.tolist()
-        ranges = {(s.row_start, s.row_end) for s in spans}
-        cuts = sorted({*query_start_loc_cpu, *(row for r in ranges for row in r)})
-        req_indices, seq_lens, dynamic_causal = [], [], []
-        for start, end in zip(cuts, cuts[1:]):
-            req_idx = bisect_right(query_start_loc_cpu, start) - 1
-            req_indices.append(req_idx)
-            # Keys end with the piece's last row, which puts its queries at their
-            # positions.
-            rows_after = query_start_loc_cpu[req_idx + 1] - end
-            seq_lens.append(int(seq_lens_cpu[req_idx]) - rows_after)
-            dynamic_causal.append((start, end) not in ranges)
+        seq_lens_list = seq_lens_cpu.tolist()
+        spans_by_req: dict[int, list[MMPrefixQuerySpan]] = {}
+        for span in sorted(spans):
+            spans_by_req.setdefault(span.req_idx, []).append(span)
 
-        query_start_loc = torch.tensor(cuts, dtype=torch.int32)
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32)
-        dynamic_causal_tensor = torch.tensor(dynamic_causal, dtype=torch.int32)
+        # Each request becomes causal pieces around its non-causal range pieces.
+        pieces: list[tuple[int, int, int, bool]] = []  # request, start, end, causal
+        for req_idx in range(common_attn_metadata.num_reqs):
+            row = query_start_loc_cpu[req_idx]
+            for span in spans_by_req.get(req_idx, []):
+                pieces.append((req_idx, row, span.row_start, True))
+                pieces.append((req_idx, span.row_start, span.row_end, False))
+                row = span.row_end
+            pieces.append((req_idx, row, query_start_loc_cpu[req_idx + 1], True))
+        pieces = [piece for piece in pieces if piece[1] < piece[2]]
+
+        req_indices = [req_idx for req_idx, *_ in pieces]
+        query_start_loc = torch.tensor(
+            query_start_loc_cpu[:1] + [end for _, _, end, _ in pieces],
+            dtype=torch.int32,
+        )
+        # Keys end with a piece's last row, which puts its queries at their
+        # positions.
+        seq_lens = torch.tensor(
+            [
+                seq_lens_list[req_idx] - (query_start_loc_cpu[req_idx + 1] - end)
+                for req_idx, _, end, _ in pieces
+            ],
+            dtype=torch.int32,
+        )
+        dynamic_causal = torch.tensor(
+            [causal for *_, causal in pieces], dtype=torch.int32
+        )
         scheduler_metadata = ops.cpu_attn_get_scheduler_metadata(
-            num_reqs=len(req_indices),
+            num_reqs=len(pieces),
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
-            seq_lens=seq_lens_tensor,
+            seq_lens=seq_lens,
             dtype=self.dtype,
             query_start_loc=query_start_loc,
             causal=False,
             sliding_window_size=self.window_size,
             isa=self.isa,
             enable_kv_split=envs.VLLM_CPU_ATTN_SPLIT_KV,
-            dynamic_causal=dynamic_causal_tensor,
+            dynamic_causal=dynamic_causal,
             kv_cache_dtype=self.kv_cache_dtype,
         )
         return CPUMMPrefixMetadata(
             query_start_loc=query_start_loc,
-            seq_lens=seq_lens_tensor,
+            seq_lens=seq_lens,
             block_table=common_attn_metadata.block_table_tensor[req_indices],
             scheduler_metadata=scheduler_metadata,
-            dynamic_causal=dynamic_causal_tensor,
+            dynamic_causal=dynamic_causal,
         )
 
 
